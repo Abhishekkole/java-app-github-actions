@@ -1,0 +1,186 @@
+name: Java CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}:latest
+
+jobs:
+  # -------------------------------
+  # 1️⃣ Build
+  # -------------------------------
+  build:
+    name: Build with Maven
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'maven'
+
+      - name: Build with Maven
+        run: mvn -B clean package
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-build
+          path: target/*.war
+
+  # -------------------------------
+  # 2️⃣ SonarQube Scan
+  # -------------------------------
+  sonar:
+    name: SonarQube Scan
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'maven'
+
+      - name: Run SonarQube Scan
+        run: mvn sonar:sonar \
+             -Dsonar.projectKey=my-java-app \
+             -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+             -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+
+  # -------------------------------
+  # 3️⃣ Snyk Security Scan
+  # -------------------------------
+  snyk:
+    name: Snyk Security Scan
+    runs-on: ubuntu-latest
+    needs: sonar
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'maven'
+
+      - name: Install Snyk CLI
+        uses: snyk/actions/setup@master
+
+      - name: Authenticate with Snyk
+        run: snyk auth ${{ secrets.SNYK_TOKEN }}
+
+      - name: Snyk test for Maven (SCA)
+        run: snyk test --all-projects --severity-threshold=medium
+
+      - name: Download build artifact for Docker scan
+        uses: actions/download-artifact@v4
+        with:
+          name: java-build
+          path: target
+
+      - name: Build Docker image for scan
+        run: docker build -t $IMAGE_NAME .
+
+      - name: Snyk test for Docker image
+        run: snyk container test $IMAGE_NAME --severity-threshold=medium
+
+  # -------------------------------
+  # 4️⃣ Deploy Artifact to Nexus
+  # -------------------------------
+  nexus:
+    name: Deploy Artifact to Nexus
+    runs-on: ubuntu-latest
+    needs: snyk
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'maven'
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: java-build
+          path: target
+
+      - name: Deploy artifact to Nexus
+        run: mvn deploy -DaltDeploymentRepository=nexus::default::${{ secrets.NEXUS_URL }}
+        env:
+          MAVEN_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+  # -------------------------------
+  # 5️⃣ Docker Build & Push
+  # -------------------------------
+  docker:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: nexus
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: java-build
+          path: target
+
+      - name: Build Docker Image
+        run: docker build -t $IMAGE_NAME .
+
+      - name: Log in to GHCR
+        run: echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u ${{ secrets.GHCR_USERNAME }} --password-stdin
+
+      - name: Push Docker Image
+        run: docker push $IMAGE_NAME
+
+  # -------------------------------
+  # 6️⃣ Deploy to Tomcat
+  # -------------------------------
+  deploy:
+    name: Deploy to Tomcat
+    runs-on: ubuntu-latest
+    needs: docker
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: java-build
+          path: target
+
+      - name: Deploy WAR to Tomcat
+        run: bash scripts/deploy-tomcat.sh
+        env:
+          TOMCAT_HOST: ${{ secrets.TOMCAT_HOST }}
+          TOMCAT_USER: ${{ secrets.TOMCAT_USER }}
+          TOMCAT_PASS: ${{ secrets.TOMCAT_PASS }}
